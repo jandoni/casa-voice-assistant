@@ -1,0 +1,12 @@
+[Unit]
+Description=casa wake verifier (second stage of the on-device wake word, :10350)
+After=network-online.target
+
+[Service]
+ExecStart=/opt/casa-stt/venv/bin/python /opt/casa-stt/wake_verify.py
+Restart=always
+RestartSec=2
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

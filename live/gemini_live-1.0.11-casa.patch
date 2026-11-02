@@ -1,0 +1,339 @@
+--- a/custom_components/gemini_live/conversation.py
++++ b/custom_components/gemini_live/conversation.py
+@@ -80,6 +80,72 @@
+     async_add_entities([entity_class(hass, config_entry)])
+ 
+ 
++
++# CASA PATCH (2026-10-20): TV false wakes. An Echo woke on TV dialogue, Gemini heard Korean words, said
++# "could you repeat?" -> the mic re-opened -> the TV again -> "repeat in English?" ... while we asked it to stop.
++# (1) a turn whose words can't be a request for us (other scripts / Spanish marks always; a single non-command word
++#     while the TV plays) is dropped SILENTLY: no reply audio, conversation ended.
++# (2) while the TV plays, a "didn't catch that / repeat" reply never re-opens the mic.
++import re as _casa_re
++
++_CASA_ONE_WORD_OK = {"stop", "pause", "play", "resume", "next", "skip", "cancel", "thanks", "yes", "no", "yeah", "nope",
++                     "help", "louder", "quieter", "mute", "unmute", "volume", "lights", "off", "on"}
++_CASA_NOT_UNDERSTOOD_RE = _casa_re.compile(r"(didn'?t (quite )?(catch|understand|hear|get)|(could|can) you (please )?(repeat|say (that|it) again)|"
++                                           r"say that again|in english|not sure what you|"
++                                           # (2026-10-23) Gemini's other ways of asking "what did you want?"
++                                           r"did you need something|what (would|do) you (like|need|want)|how can i help|what can i do for you)", _casa_re.I)
++# (2026-10-23) Spanish WITHOUT accents slipped through the "not English" rule: a false wake on people talking
++# ("Yo no lo cojo.") -> "Sorry, could you repeat?" -> 3 more listening turns of their conversation. Words that
++# are unmistakably Spanish (no English look-alikes such as no / me / a / con); a turn whose words are MORE than half
++# of these is not for us. ("Play La La Land" = 2 of 4 -> still English.)
++_CASA_ES_WORDS = {"yo", "lo", "la", "los", "las", "el", "que", "pero", "para", "por", "porque", "una", "es", "esta", "estoy",
++                  "eres", "soy", "somos", "tengo", "tiene", "tienes", "quiero", "quieres", "vamos", "vale", "bueno", "mira",
++                  "oye", "eso", "esto", "esa", "ese", "aqui", "ahi", "alli", "ahora", "luego", "tambien", "nada", "todo",
++                  "muy", "mas", "cojo", "coge", "sabes", "creo", "dice", "digo", "hay", "hace", "hacer", "como", "cuando",
++                  "donde", "nos", "les", "mi", "su", "del", "pues", "entonces", "gracias", "hola", "venga", "claro",
++                  "verdad", "mucho", "poco", "hoy", "ayer", "puedes", "puedo", "voy", "vas", "dime", "hablar", "eh", "tio"}
++# (2026-11-01) stt.py's transcript for a turn with nothing usable in it (must match stt.CASA_SILENT)
++_CASA_SILENT = "…"
++# turns per conversation: a re-opened mic (the reply asked something back) makes the next turn a FOLLOW-UP
++_CASA_TURNS: dict[str, int] = {}
++
++
++def _casa_count_turn(conversation_id: str) -> int:
++    if len(_CASA_TURNS) > 200:
++        _CASA_TURNS.clear()
++    _CASA_TURNS[conversation_id] = _CASA_TURNS.get(conversation_id, 0) + 1
++    return _CASA_TURNS[conversation_id]
++
++
++_CASA_TV_ENTITY = "media_player.living_room_tv"   # the TV whose dialogue reaches the Echos
++_CASA_SOUNDBAR_ENTITY = "media_player.soundbar"     # a soundbar whose "TV" source also counts as the TV playing
++
++
++def _casa_tv_on(hass) -> bool:
++    atv = hass.states.get(_CASA_TV_ENTITY)
++    bar = hass.states.get(_CASA_SOUNDBAR_ENTITY)
++    return bool((atv and atv.state == "playing") or
++                (bar and bar.state == "playing" and str(bar.attributes.get("source", "")).upper() == "TV"))
++
++
++_CASA_HUSH_RE = _casa_re.compile(r"^\W*(?:(?:oh|ok|okay|just|please|hey|coco)\W+)*(shut up|be quiet|quiet(?=\W*$)|stop talking|stop it|go away|never ?mind|"
++                                 r"nothing(?=\W*$)|not you|i wasn'?t talking to you|we weren'?t talking to you|forget it|leave it|enough(?=\W*$))\b", _casa_re.I)
++
++
++def _casa_ignore_reason(hass, text: str) -> str:
++    t = (text or "").strip()
++    if _CASA_HUSH_RE.match(t):
++        return "told to be quiet"
++    if any(ord(ch) > 0x24F and ch.isalpha() for ch in t) or "¿" in t or "¡" in t:
++        return "not English"
++    words = _casa_re.findall(r"[A-Za-z']+", t)
++    es = sum(w.lower() in _CASA_ES_WORDS for w in words)
++    if es >= 2 and es * 2 > len(words):
++        return "not English"
++    if _casa_tv_on(hass) and (not words or (len(words) == 1 and words[0].lower() not in _CASA_ONE_WORD_OK)):
++        return "TV on + fragment"
++    return ""
++
+ class LiveModelConversationAgent(conversation.ConversationEntity):
+     """Shared conversation pipeline for realtime model providers."""
+ 
+@@ -511,6 +577,23 @@
+         _LOGGER.debug("Conversation Agent received input text: %s", input_text)
+ 
+         voice_turn = turn_store.take_voice_turn(conversation_id, input_text)
++        casa_turn = _casa_count_turn(conversation_id) if voice_turn else 0
++        casa_why = _casa_ignore_reason(self.hass, input_text) if voice_turn else ""
++        if (input_text or "").strip() == _CASA_SILENT:   # (2026-11-01) stt.py: nothing usable heard -> quiet end, no error
++            casa_why = "nothing heard"
++        if casa_why:
++            # CASA PATCH (2026-10-20): not meant for us -> silent (the TTS entity plays its 1 s of silence), mic stays closed
++            _LOGGER.warning("CASA: ignoring %r (%s) -> silent, conversation ended", input_text[:80], casa_why)
++            session_manager.complete_conversation(conversation_id)
++            session_manager.retire_session(conversation_id)
++            self.hass.bus.async_fire("casa_live_ignored", {"text": input_text[:120], "why": casa_why,
++                                                           "device_id": user_input.device_id})
++            chat_log.async_add_assistant_content_without_tools(
++                conversation.AssistantContent(agent_id=self.entity_id, content=""))
++            silent = IntentResponse(language=language)
++            silent.async_set_speech("")
++            return conversation.ConversationResult(response=silent, conversation_id=conversation_id,
++                                                   continue_conversation=False)
+         if voice_turn:
+             if voice_turn.complete_conversation:
+                 session_manager.complete_conversation(conversation_id)
+@@ -579,8 +662,15 @@
+         return conversation.ConversationResult(
+             response=intent_response,
+             conversation_id=conversation_id,
++            # CASA PATCH (2026-10-19): re-open the mic only when the answer asks something back (like Casa's own
++            # assistant); otherwise every answer left a 30 s listening window that swallowed the next request
+             continue_conversation=(
+                 session_manager.should_continue_conversation(conversation_id)
++                and str(assistant_text or "").rstrip().endswith("?")
++                # CASA PATCH (2026-10-20): with the TV on, "sorry, could you repeat?" doesn't re-open the mic
++                # (2026-10-23) nor on a FOLLOW-UP turn (the Casa AI pipeline's follow-up guard): a false wake used to
++                # chain "could you repeat?" -> "what would you like…?" -> "did you need something?" over people talking
++                and not ((_casa_tv_on(self.hass) or casa_turn > 1) and _CASA_NOT_UNDERSTOOD_RE.search(str(assistant_text or "")))
+             ),
+         )
+ 
+--- a/custom_components/gemini_live/gemini.py
++++ b/custom_components/gemini_live/gemini.py
+@@ -41,6 +41,9 @@
+     return model.startswith(_ASYNC_FUNCTION_CALLING_MODEL_PREFIXES)
+ 
+ 
++USAGE_HOOK = None   # CASA PATCH: set by custom_components/casa_live
++
++
+ async def async_create_gemini_client(
+     hass: Any, api_key: str, affective_dialog: bool = False
+ ) -> GeminiLiveClient:
+@@ -159,6 +162,13 @@
+             interrupted_turn = False
+             receive_next_turn = False
+             async for response in self._session.receive():
++                # CASA PATCH (2026-10-19): token usage -> USAGE_HOOK (casa_live keeps sensor.gemini_live_cost)
++                _um = getattr(response, "usage_metadata", None)
++                if _um is not None and USAGE_HOOK is not None:
++                    try:
++                        USAGE_HOOK(_um.model_dump(exclude_none=True) if hasattr(_um, "model_dump") else dict(_um))
++                    except Exception:  # noqa: BLE001
++                        pass
+                 interaction_status = _interaction_status(response)
+                 interaction_in_progress = interaction_status == "IN_PROGRESS"
+                 if response.tool_call:
+@@ -228,6 +238,8 @@
+     result: dict[str, Any] = {
+         "response_modalities": ["AUDIO"],
+         "speech_config": {
++            # (2026-10-19) "language_code": "en-US" was tried here and REMOVED: with it the native-audio model heard
++            # nothing (8/10 test runs without a transcript). English-only is in the prompt instead.
+             "voice_config": {
+                 "prebuilt_voice_config": {"voice_name": config.voice}
+             }
+@@ -240,7 +252,11 @@
+             # the user has opted into barge-in; some satellites keep sending
+             # microphone audio while the model starts its response.
+             "activity_handling": "NO_INTERRUPTION",
+-            "turn_coverage": "TURN_INCLUDES_ONLY_ACTIVITY"
++            "turn_coverage": "TURN_INCLUDES_ONLY_ACTIVITY",
++            # (2026-10-24, Jon) Gemini's OWN default end-of-speech decides when you have finished (automatic activity
++            # detection, Google's defaults, no Casa rules). The 2026-10-19 manual-activity patch (HA's VAD sent
++            # activity_end after a fixed 1 s pause, cutting long stories) is removed. casa_endpoint only keeps a
++            # 10 s silence safety net for Gemini turns in case Gemini never answers.
+         },
+     }
+     if config.support_barge_in:
+--- a/custom_components/gemini_live/runtime.py
++++ b/custom_components/gemini_live/runtime.py
+@@ -25,7 +25,10 @@
+ # barge-in interruption discards very little unplayed audio, so the assistant
+ # stops quickly. The producer is paused while the buffer is full instead of
+ # racing ahead of playback.
+-AUDIO_STREAM_MAX_BUFFER_BYTES = 6400
++# CASA PATCH (2026-10-16): was 6400 (~0.13 s). On HA 2026.9 the pipeline only starts reading the reply audio once ~60
++# characters of text exist (or the turn ends), so short answers deadlocked against this backpressure for the whole
++# response_timeout (30 s) and the Echo would have heard only the first word. ~40 s of 24 kHz audio; barge-in is off.
++AUDIO_STREAM_MAX_BUFFER_BYTES = 2_000_000
+ 
+ 
+ @dataclass(slots=True)
+--- a/custom_components/gemini_live/stt.py
++++ b/custom_components/gemini_live/stt.py
+@@ -91,7 +91,44 @@
+ )
+ 
+ _LOGGER = logging.getLogger(__name__)
++# CASA PATCH (2026-11-01): transcript of a turn in which nothing usable was heard; conversation.py ends it silently
++CASA_SILENT = "…"
++# CASA PATCH (2026-11-02): the Echo's stream starts while "Alexa" is still being said. Its last ~0.3 s followed by the
++# pause before the question looked like a finished utterance to Gemini's end-of-speech: it answered "…xa" as the
++# question began and the turn was closed mid-sentence.
++# The first CASA_LEAD_BYTES are held back; speech that stops before CASA_TAIL_MAX_S and is followed by a quiet gap
++# (>= 240 ms) is the wake word's tail -> replaced with silence. A command said in one breath (no gap) is sent as is.
++CASA_LEAD_BYTES = 25600   # 0.8 s of 16 kHz PCM16 (sent in one go once collected: no delay at the end of the question)
++CASA_TAIL_MAX_S = 0.5
+ 
++
++def _casa_strip_wake_tail(pcm: bytes) -> bytes:
++    try:
++        import numpy as np
++
++        x = np.frombuffer(pcm[: len(pcm) // 2 * 2], np.int16).astype(np.float32) / 32768
++        if len(x) < 6400:
++            return pcm
++        spec = np.fft.rfft(x)
++        spec[: int(90 * len(x) / 16000)] = 0          # raw mic: DC + rumble
++        y = np.fft.irfft(spec, len(x))
++        n = len(y) // 320                               # 20 ms frames
++        db = 20 * np.log10(np.sqrt((y[: n * 320].reshape(n, 320) ** 2).mean(1)) + 1e-9)
++        run, start = 0, None
++        for i in range(n):
++            run = run + 1 if db[i] < -55 else 0
++            if run >= 12:
++                start = i - 11
++                break
++        if start is None or start * 0.02 > CASA_TAIL_MAX_S or not (db[:start] > -45).any():
++            return pcm
++        out = bytearray(pcm)
++        out[: start * 640] = bytes(start * 640)
++        _LOGGER.warning("CASA: silenced the wake word's tail (first %.2f s) before the question", start * 0.02)
++        return bytes(out)
++    except Exception:  # noqa: BLE001 - never break a voice turn
++        return pcm
++
+ # Target optimal chunk payload size (100ms of 16kHz 16-bit mono PCM = 3200 bytes)
+ OPTIMAL_STREAM_CHUNK_SIZE = 3200
+ 
+@@ -734,7 +771,13 @@
+                     chunk_count = 0
+ 
+                     _LOGGER.warning("[turn=%s] send_audio task spawned", turn_id)
++                    # CASA PATCH (2026-10-19): tell casa_endpoint this is a Gemini turn (fixed end-of-speech pause)
++                    try:
++                        self.hass.bus.async_fire("casa_live_text", {"text": "", "final": False, "engine": "gemini"})
++                    except Exception:  # noqa: BLE001
++                        pass
+ 
++                    casa_lead: bytearray | None = bytearray()   # CASA PATCH (2026-11-02): wake-word tail
+                     async for chunk in stream:
+                         if not chunk:
+                             continue
+@@ -744,6 +787,12 @@
+                                 data_offset = chunk.find(b"data")
+                                 if data_offset != -1:
+                                     chunk = chunk[data_offset + 8 :]
++                        if casa_lead is not None:
++                            casa_lead.extend(chunk)
++                            if len(casa_lead) < CASA_LEAD_BYTES:
++                                continue
++                            chunk = _casa_strip_wake_tail(bytes(casa_lead))
++                            casa_lead = None
+ 
+                         audio_buffer.extend(chunk)
+ 
+@@ -768,6 +817,8 @@
+                             await session.send_audio(dispatch_chunk)
+                             audio_sent = True
+ 
++                    if casa_lead:   # the stream ended inside the first 0.8 s
++                        audio_buffer.extend(_casa_strip_wake_tail(bytes(casa_lead)))
+                     if len(audio_buffer) > 0:
+                         chunk_count += 1
+                         dispatch_chunk = bytes(audio_buffer)
+@@ -813,9 +864,20 @@
+                 nonlocal last_response_activity
+                 nonlocal sound_selected
+                 replacement_response_pending = False
++                casa_reply_told = False
+                 try:
+                     _LOGGER.warning("[turn=%s] receive_responses started", turn_id)
+                     async for response in session.receive():
++                        # CASA PATCH (2026-11-01): Gemini only answers once ITS end-of-speech detection decided the
++                        # question is over -> tell casa_endpoint, which closes the mic now. Before, HA's segmenter
++                        # waited its 10 s safety net on every Echo turn (the stream never ends on its own).
++                        if not casa_reply_told and (response.tool_calls or response.audio or response.text
++                                                    or response.output_transcript):
++                            casa_reply_told = True
++                            try:
++                                self.hass.bus.async_fire("casa_gemini_replied", {"turn": turn_id})
++                            except Exception:  # noqa: BLE001
++                                pass
+                         if (
+                             response.user_activity_started
+                             or response.interrupted
+@@ -1048,6 +1110,12 @@
+                             )
+                             input_transcript_parts.append(transcription)
+                             input_transcript_received.set()
++                            # CASA PATCH (2026-10-19): Gemini's live transcript -> casa_live_text, so the Echo screen shows
++                            # the words and casa_endpoint's smart end-of-speech knows a sentence is unfinished
++                            try:
++                                self.hass.bus.async_fire("casa_live_text", {"text": "".join(input_transcript_parts).strip(), "final": False, "engine": "gemini"})
++                            except Exception:  # noqa: BLE001
++                                pass
+                             _LOGGER.warning(
+                                 "[turn=%s] inputTranscription text len=%d text=%r",
+                                 turn_id,
+@@ -1245,10 +1313,26 @@
+                     except asyncio.CancelledError:
+                         pass
+                 else:
++                    casa_mic_closed = time.monotonic()
+                     while not receive_task.done():
+-                        remaining = response_inactivity_timeout - (
++                        # CASA PATCH (2026-10-19): the mic closed and Gemini heard NO words (an empty follow-up window,
++                        # a door, TV): end now instead of waiting the whole response timeout (30 s, Echo stuck
++                        # "listening"), and don't re-open the mic for another empty turn
++                        # (2026-11-01) 3.0 -> 2.0 s: a late transcript arrives well within that; the Echo sat "listening"
++                        if (not input_transcript_parts and not first_audio.is_set()
++                                and time.monotonic() - casa_mic_closed > 2.0):
++                            _LOGGER.warning("[turn=%s] CASA: no speech heard -> ending the turn", turn_id)
++                            receive_task.cancel()
++                            try:
++                                await receive_task
++                            except asyncio.CancelledError:
++                                pass
++                            session_manager.complete_conversation(conversation_id)
++                            session_manager.retire_session(conversation_id)
++                            break
++                        remaining = min(1.0, response_inactivity_timeout - (
+                             time.monotonic() - last_response_activity
+-                        )
++                        ))
+                         if remaining <= 0:
+                             _LOGGER.warning(
+                                 "[turn=%s] cancelling receive task after %.1fs without response activity",
+@@ -1322,10 +1406,11 @@
+                 SpeechResultState.SUCCESS,
+             )
+         if not final_text:
+-            _LOGGER.error(
+-                "STT: Live model returned no usable transcript or response text"
+-            )
+-            return SpeechResult(None, SpeechResultState.ERROR)
++            # CASA PATCH (2026-11-01): nothing usable was heard (a wake on a whisper / noise / a pause). An ERROR here
++            # becomes stt-stream-failed and the Echo played an error sound + showed a message after ~19 s of
++            # "listening". Return the silent marker instead: conversation.py ends the turn quietly.
++            _LOGGER.warning("STT: no usable transcript -> silent end (%s)", CASA_SILENT)
++            return SpeechResult(CASA_SILENT, SpeechResultState.SUCCESS)
+ 
+         assistant_text = response_text
+ 

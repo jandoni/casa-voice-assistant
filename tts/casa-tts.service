@@ -1,0 +1,11 @@
+[Unit]
+Description=casa-tts - Kokoro Wyoming text-to-speech for Home Assistant (voice af_bella)
+After=network-online.target
+
+[Service]
+ExecStart=/opt/casa-tts/venv/bin/python /opt/casa-tts/casa_tts.py --uri tcp://0.0.0.0:10340 --voice af_bella --threads 6
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

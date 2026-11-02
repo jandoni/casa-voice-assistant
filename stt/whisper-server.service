@@ -1,0 +1,14 @@
+[Unit]
+Description=whisper.cpp server on the Arc iGPU (Vulkan) - accurate stage-2 STT for casa-stt
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/whisper.cpp
+EnvironmentFile=-/opt/casa-stt/whisper.env
+ExecStart=/opt/whisper.cpp/build/bin/whisper-server -m /opt/whisper.cpp/models/ggml-medium-q5_0.bin -l en -bs 1 -ac 512 -nf -sns -t 4 --host 127.0.0.1 --port 10320 --prompt "${WHISPER_PROMPT}"
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

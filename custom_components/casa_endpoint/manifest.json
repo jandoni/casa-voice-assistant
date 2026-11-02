@@ -1,0 +1,10 @@
+{
+  "domain": "casa_endpoint",
+  "name": "Casa smart end-of-speech",
+  "codeowners": [],
+  "dependencies": ["assist_pipeline"],
+  "documentation": "https://github.com/jandoni/casa-voice-assistant",
+  "iot_class": "local_push",
+  "requirements": [],
+  "version": "1.0.0"
+}

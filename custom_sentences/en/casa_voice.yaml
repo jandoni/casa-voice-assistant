@@ -1,0 +1,13 @@
+# Sentinel sentences casa-stt sends to HA (see stt/casa_stt.py). Reload with conversation.reload after editing.
+language: "en"
+intents:
+  # casa-stt heard a house command it could not make sense of -> instant local "didn't catch that" (no LLM turn)
+  CasaNotUnderstood:
+    data:
+      - sentences:
+          - "casa did not understand"
+  # wake-word training capture (casa-stt capture.flag): answer every turn silently
+  CasaCapture:
+    data:
+      - sentences:
+          - "casa capture sample"

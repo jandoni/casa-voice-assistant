@@ -1,0 +1,80 @@
+NOTICE
+
+The MIT licence in LICENSE covers my own code and documents in this repository. It does not cover the third-party
+code that two patch files are based on, or the projects this code works with. Those keep their own licences.
+
+1. Third-party code contained in this repository (as context and modified lines of a patch)
+-------------------------------------------------------------------------------------------
+
+patches/assist_canonicalizer-1.14.0-casa.patch
+  A diff against custom_components/assist_canonicalizer/conversation.py of Assist Canonicalizer 1.14.0,
+  https://github.com/luuquangvu/assist-canonicalizer . The lines it adds are mine; its context lines are from the
+  original file, under this licence:
+
+    MIT License
+    
+    Copyright (c) 2026 Lưu Quang Vũ
+    
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+    
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+    
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+live/gemini_live-1.0.11-casa.patch
+  A diff against custom_components/gemini_live of ha-gemini-live v1.0.11, https://github.com/matt123p/ha-gemini-live .
+  The lines it adds are mine; its context lines are from the original files, under this licence:
+
+    MIT License
+    
+    Copyright (c) 2026 Matt Pyne
+    
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+    
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+    
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+2. Third-party software that code here modifies but does not contain
+--------------------------------------------------------------------
+
+View Assist Companion App (VACA), https://github.com/msp1974/ViewAssistCompanionApp
+  Copyright 2025 Mark Parker, licensed under the Apache License, Version 2.0 (based on openWakeWord by dscripka and
+  OpenwakewordforAndroid by Hasanat Ahmed Lodhi). vaca-patch/patch_preload.py and vaca-patch/patch_norevoke.py change
+  a decompiled VACA build; the short smali snippets they insert are mine. vaca-patch/CasaVerify.java and
+  vaca-patch/CasaVolume.java are my own classes, compiled into such a build. No VACA code or APK is included.
+  A build patched this way is a modified version of VACA and must be distributed, if at all, under VACA's licence.
+
+3. Projects used at runtime (not included; check their licences and model cards)
+--------------------------------------------------------------------------------
+
+Home Assistant and its Wyoming protocol; sherpa-onnx (k2-fsa); the Kroko streaming Zipformer ASR model (Banafo);
+NVIDIA Parakeet TDT 0.6B v3; whisper.cpp and the OpenAI Whisper models; Kokoro-82M (hexgrad) via kokoro-onnx;
+microWakeWord and pymicro-wakeword; Ollama and the IBM Granite 4.2 and Google Gemma models; Open WebUI and SearXNG;
+the Anthropic Claude API; the Google Gemini Live API; Piper; apktool and the Android SDK build tools.
+
+No model weights, APKs, firmware or recordings are included in this repository.

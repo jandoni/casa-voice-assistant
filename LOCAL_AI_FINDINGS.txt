@@ -1,0 +1,417 @@
+LOCAL AI ON AN INTEL CORE ULTRA MINI PC: FINDINGS LOG
+=====================================================
+Started 2026-09-18 (sessions of 2026-09-17/18), appended as things changed. Public edition: hostnames, addresses,
+config entry ids and household details are removed; every measurement is as logged. Companion files:
+casa_prompt.txt (the local "Casa" prompt), ai-eval/ (the test scripts), STT_TTS_BENCHMARKS.md (speech engines).
+
+
+1. HARDWARE AND WHERE IT RUNS
+-----------------------------
+Box: Intel Core Ultra 7 mini PC (Meteor Lake, 6P+8E+2LP cores), 32 GB DDR5, 1 TB NVMe, Intel Arc iGPU (8 Xe cores,
+shares system RAM), Intel NPU. Proxmox VE host.
+AI guest ("voice host"): an LXC container on Ubuntu 26.04 (needed for Mesa 26 = working Vulkan on this iGPU),
+12 cores, 20 GB memory cap (a cap, not a reservation), 100 GB disk, /dev/dri/renderD128 passed through.
+Home Assistant runs in its own VM on the same host (4 vCPU).
+
+Practical ceiling of this iGPU (measured, not theoretical):
+  - text generation ≈ 6.5–10 tokens/s for 3–4B models, ≈ 5 tok/s for the 26B MoE, ≈ 14 tok/s for a 1.5B-active MoE
+  - prompt reading ≈ 50–370 tokens/s depending on the model architecture
+  - effective memory bandwidth ≈ 22 GB/s, so tokens/s ≈ 22 / (model size in GB). A dense 27B (16 GB) would crawl at ~1.5 tok/s.
+  - every generated token costs ~150 ms, so answer LENGTH is the main latency lever, not the model.
+
+
+2. RUNTIMES / BACKENDS TRIED
+----------------------------
+KEPT   Ollama 0.34.1 with the Vulkan backend. Needs OLLAMA_IGPU_ENABLE=1 or it silently falls back to CPU.
+       systemd override:
+         OLLAMA_HOST=0.0.0.0:11434  OLLAMA_IGPU_ENABLE=1  OLLAMA_KEEP_ALIVE=24h
+         OLLAMA_MAX_LOADED_MODELS=2  OLLAMA_NUM_PARALLEL=2  OLLAMA_CONTEXT_LENGTH=8192
+REJECTED llama.cpp OpenVINO backend (OpenVINO 2026.4 preview, built from source):
+       llama-bench numbers were spectacular (gemma3 4B: 567 pp / 15.4 tg = 2x Vulkan) but llama-server
+       returned garbage or empty text in every configuration tried (stateful on/off, ctx sizes, batch sizes);
+       single-shot completions were fine, chat serving was not. 12B models OOM'd above 16 GB.
+REJECTED IPEX-LLM (unmaintained), NPU (slower than the iGPU for LLMs), CPU-only (≤ 0.2 tok/s, useless).
+NOTE   MoE gives no raw speed win over a dense model of the same ACTIVE size on this chip, but it gives
+       bigger-model quality at small-model speed (gemma4 26B-A4B ≈ 5 tok/s like a 4B, at 15.6 GB).
+
+
+3. HOW THINGS WERE TESTED (scripts in ai-eval/, all need config.env exported: set -a; . ./config.env)
+--------------------------------------------------------------------------------------------------
+llm_bench.py MODEL [n]       Raw speed. Sends a ~2.7k-token HA-like prompt (room/light list repeated) + the trick
+                             question "which rooms have a pendant?" twice: run 1 = cold prompt processing speed,
+                             run 2 = warm (cache hit) + generation speed. Correct answer: kitchen and bedroom only.
+tool_probe.py MODEL…         Tool-calling sanity. 6 requests with HA-style tool schemas (HassTurnOn/Off, HassLightSet,
+                             GetLiveContext) and a 1k-token device list: direct command, brightness, fuzzy request,
+                             area-wide off, state question, general knowledge (must NOT call a tool).
+ha_agent_eval.py AGENT       The real thing. 10 commands through HA's conversation API (POST /api/conversation/process,
+                             agent_id = conversation.xxx) against the real house (84 exposed entities). Checks the
+                             actual entity state after each action, times every command, restores the test lights.
+ha_pipeline_trace.py "text"  Why is it slow? Runs the Casa AI pipeline over WebSocket (assist_pipeline/run) and prints
+                             the model's raw output per turn: text, tool calls, tool results, hidden thinking.
+make_chat_model.py           Builds the "chat" preset (see 6).
+Ollama journal:              journalctl -u ollama | grep -E "prompt eval time|eval time|evict|loaded runners"
+                             shows per-request prompt tokens re-processed vs cached, generation tokens, evictions.
+Grading rule: a command counts only if the device really changed; a question counts only if the answer is right
+(read the answers: an "OK" from the script for a confident wrong answer is still a fail).
+
+
+4. MODELS TESTED: RAW SPEED (Vulkan, 2.7k-token prompt, llm_bench.py)
+---------------------------------------------------------------------
+model                     disk    resident   prompt tok/s  gen tok/s  trick question   notes
+qwen3.5:4b                3.4 GB  3.6 GB     102           6.5        wrong            tools+vision+thinking; thinks unless think:false
+gemma3:4b (= "chat")      3.3 GB  3.3 GB     188           7.4        n/a              vision (fixed 256 tokens/image), no tools
+gemma4:26b-a4b-it-qat    15.6 GB 15.3 GB      48           5.1        correct          MoE 4B active; evicts everything else
+gemma4:e4b-it-qat         6.1 GB  3.3 GB      56           6.4        correct          GARBAGE output once prompt ≈ 5k tokens (Vulkan bug)
+gemma4:12b (Q4_K_M)       7.6 GB    –          29           2.8        garbage          same Vulkan bug, plus too slow
+gpt-oss:20b (MXFP4)        12 GB   12 GB     150           4.5        (reasoning only) never produced a final answer
+lfm2.5:8b (8B-A1.5B MoE)  5.2 GB  5.5 GB     373          14.2        (thinks)         fastest by far; reasoning-only model
+granite4.2:3b             2.2 GB  4.9 GB     209          10.0        half right       hybrid Mamba; excellent cache reuse
+granite4.2:8b             5.3 GB  8.0 GB     119           5.7        wrong
+qwen3.5:9b                6.6 GB  5.7 GB      85           5.0        wrong
+LFM2-2.6B Q8 (hf.co)      2.7 GB    –           –             –        –                wrong tools in the probe (TurnOff for "dim")
+LFM2.5-1.2B-Instruct Q8   1.2 GB  1.6 GB       –             –        –                fast, 5/6 on the probe, ~3/10 in HA
+OpenVINO gemma3 4B        (bench only) 567 / 15.4, server output broken
+OpenVINO qwen3.5 4B       (bench only) 270 /  4.5, server output broken
+"resident" = what `ollama ps` shows with the context size used (HA agents use num_ctx 16384, phone 8192).
+
+
+5. MODELS TESTED: THROUGH HOME ASSISTANT (ha_agent_eval.py, 84 entities, same 10 commands)
+-----------------------------------------------------------------------------------------
+Commands: turn on Jon's light · set Jon's light to 30 percent · what's the thermostat set to? · which lights are on
+in the office? · turn off Jon's light · it's a bit dark at Jon's desk · turn on the monitor light · turn off everything
+in the office · who painted the Mona Lisa? · how many lights are in the kitchen?
+
+granite4.2:3b        9/10   questions 2–12 s, actions 23–31 s (before prompt fix), cold start 36 s.
+                            Miss: asked which "monitor light" (a light bar that had a model number as its entity id).
+qwen3.5:4b           8/10   14–55 s per command. Re-reads ~1,020 prompt tokens on EVERY new conversation
+                            (≈12 s tax at 82 tok/s); granite re-reads only 12–310. Also refused the monitor light.
+lfm2.5:8b            6/10   7–20 s. Hallucinated a "Master Bedroom" light, claimed "done" without acting,
+                            leaked reasoning into spoken answers once thinking was suppressed.
+LFM2.5-1.2B         ~3/10   Fast but wrong: office lights "on" = living-room lights; refused general questions.
+gemma4:e4b          fail    First request (4,949-token prompt) returned <unused2162>菜… tokens; HA 500.
+gemma4:26b-a4b       not yet run through HA (the HA community's top pick, see 8). Costs 15.6 GB + evictions.
+
+DECISION 2026-09-18: Casa = granite4.2:3b. qwen3.5:4b kept as fallback. 26B kept for one more test.
+
+
+6. WHAT IS LIVE NOW (as of 2026-09-18)
+--------------------------------------
+Ollama models kept: granite4.2:3b (Casa), chat (phone), qwen3.5:4b (fallback), gemma4:26b-a4b-it-qat (smart mode).
+Two stay resident (MAX_LOADED_MODELS=2): chat + granite. Loading order matters: the keep-warm automation loads
+chat first, then Casa; the reverse order made Ollama evict the HA model once.
+
+"chat" = gemma3:4b + a custom TEMPLATE (POST /api/create, script make_chat_model.py) that injects brevity rules into
+the first turn no matter what the app sends (the phone app adds its own "today is…/iOS" system prompt, which made raw
+models write date-arithmetic essays). Rules: answer first, no greetings/follow-ups/disclaimers/emojis/markdown, one
+sentence for facts, complete-but-compact for recipes/instructions, 1–2 sentences for photos, reply in the user's
+language. num_predict 400. Measured: "Hello how are you?" → "I am functioning normally." 2.5 s; a sports question
+2.5 s; recipe with steps 10 s; photo 20 s. Knowledge stops ~2024: small models don't know recent facts.
+
+HA agents (Ollama integration):
+  Casa  granite4.2:3b, assist API (device control), num_ctx 16384, max_history 20, keep_alive -1, think false,
+        prompt = casa_prompt.txt
+  Ask   no device control, longer answers
+Pipeline "Casa AI": Whisper → local intents first → Casa → Piper.
+Exposed: 84 entities; aliases on 31 devices/scenes.
+Tools exposed to the model: the HA intent tools + GetLiveContext + a "send to my phone" script.
+
+Casa prompt effect (ha_pipeline_trace.py, warm):
+  dim the TV light to 20 percent      28.8 s / 3 turns (text → needless GetLiveContext → text → HassLightSet)  →  15.6 s / 2 turns
+  turn off everything in the office   24.9 s                                                                   →  15.0 s
+  what's the thermostat set to?        8.8 s (GetLiveContext + answer)                                          →   8.4 s
+  who painted the Mona Lisa?           2.1 s                                                                    →   2.2 s
+  it's a bit dark at Jon's desk       23–32 s (it checks state first, then acts: acceptable for a vague ask)
+  turn on Jon's light / 30 percent     0.0 s (local intent matcher, no model involved)
+Floor for a model-handled command ≈ 15 s = ~50-token tool-call JSON + ≤8-word confirmation at ~7 tok/s + 2 prompt
+reads. Going lower means more phrases hitting the 0-s local matcher (aliases, custom_sentences), not another model.
+
+
+7. GOTCHAS LEARNED (the expensive ones)
+---------------------------------------
+- Thinking: qwen3.5 thinks unless the request carries think:false (a one-line answer took 115 s with 3,000 chars
+  of reasoning). The phone app does not send think:false, so on the phone use only "chat". LFM2.5 ignores think:false
+  entirely (reasoning-only model); an assistant prefill of "<think>\n\n</think>\n" skips it.
+- Images: qwen3.5 turns a full-resolution photo into ~4,500 tokens (60 s to "look"); gemma3 uses a fixed 256.
+- Ollama keeps one runner per (weights blob, num_ctx): "chat" and gemma3:4b share a runner; the same model at a
+  different num_ctx spawns a second copy and evicts others.
+- Eviction is LRU with a pessimistic memory estimate; 2 small models (≈9 GB) coexist under the 20 GB cap, the 26B
+  evicts both, and HA reloads its own model on the next request (~36–70 s once). No OOM kills seen with Ollama.
+- HA 2026.7.1 prompt is static (no timestamp: GetDateTime is a tool), so caching works; GetLiveContext returns
+  ~1,000 tokens of state each time it is called (that is why "check state then act" doubles the time).
+- rest_command in a package needed a full HA restart to appear (homeassistant.reload_all does not add domains).
+- Vulkan on this iGPU corrupts Gemma 4 (12B and E4B) output on long prompts; the 26B-A4B QAT answered correctly at 2.7k.
+- pkill -f <pattern> matches your own shell command line; use pkill -x.
+
+
+8. RESEARCH NOTES (Sept 2026)
+-----------------------------
+- HA community thread "My journey to a reliable and enjoyable locally hosted voice assistant": best = gemma4 26B-A4B
+  QAT ("all green" on multi-device calls, misheard commands, false positives), then gpt-oss 20B and GLM 4.7 Flash;
+  Qwen 4B rejected (brightness/volume unreliable, context exhaustion > ~50 entities). Their speed tricks: llama.cpp
+  prompt caching, ≤ 32 entities, Q8 quants, a very structured system prompt. They run RTX 3090-class GPUs (100+ tok/s),
+  which is why they report 1–2 s actions where I get 15 s for the identical exchange.
+- Qwen 3.6 / 3.8 shipped only 27B+ sizes (Qwen3.8-27B is dense: ~1.5 tok/s here). Sub-10B Qwen = 3.5 series.
+- New sub-10B releases worth knowing: lfm2.5:8b (fast, reasoning-only), granite4.2 3B/8B (Aug 2026), gemma4 E2B/E4B,
+  nemotron-3.5-lightning 30B-A3B and laguna-xs 33B-A3B (same size class as the 26B), minicpm-v4.6 1B (vision only).
+- HA fine-tunes (Home-1B/3B, HomeGem4Bn) are older bases / tiny training runs: not pursued.
+- Bonsai 2 27B (PQ2 ~7 GB, needs its own llama.cpp fork): untested; bandwidth math says ~3 tok/s here.
+
+
+9. OPEN QUEUE (at the time)
+---------------------------
+- Custom sentences (custom_sentences/en/*.yaml) so phrasings like "dim X to N percent" hit the 0-s matcher; aliases for
+  every device (new devices must get aliases too).
+- Run gemma4:26b-a4b-it-qat through ha_agent_eval.py once (needs 15.6 GB; expect 5 tok/s).
+- Open WebUI + HA's MCP Server integration = one phone chat with house control + documents + photos + web search.
+
+
+10. HARDWARE LIMITERS: INVESTIGATED 2026-09-18 (why the iGPU only gets ~22 GB/s of the RAM's 67)
+-----------------------------------------------------------------------------------------------
+Checked and healthy: 2 x 16 GB DDR5-5600, one per memory controller (dual channel, full speed);
+CPU memcpy bandwidth 67 GB/s (75 % of 89.6 theoretical); i915 driver, GPU requests 2250 MHz; governor
+performance; 65 C under load; latest BIOS from the vendor.
+Limiter 1: PL4 (peak power) throttling. While generating, the GPU actually runs 900-1500 MHz with
+  /sys/class/drm/card0/gt/gt0/throttle_reason_pl4 = 1 (pl1/pl2/thermal = 0) at only ~19.6 W package.
+  PL4 is set by the vendor firmware and not exposed to Linux (RAPL/MSR): BIOS only.
+  PL2 was 43 W (vendor default), raised to Intel's 64 W spec via /sys/class/powercap (PL1 stays 28 W) with a host
+  service at boot. Measured +12 % (10.1 → 11.3 tok/s).
+Limiter 2: Vulkan Q4 kernels. Q8_0 (2x bytes) runs only 30 % slower than Q4_K_M (7.0 vs 10.1 tok/s),
+  so the GPU can stream >= 27 GB/s; the 4-bit path is partly compute/kernel-bound.
+SYCL backend (Intel oneAPI 2026.1, llama.cpp, fa off; fa=1 is slower: no XMX on Meteor Lake):
+  llama-bench granite 3B: pp 257 / tg 18.7 (vs Vulkan 209 / 10.1), BUT at a realistic 3.5k-token context in
+  server mode: tg 9.7-10.1 vs Vulkan 8.2-8.6 (+15-20 %), pp 164 vs 196 (slower). Qwen3.5 GGUF would not load
+  on SYCL. Not worth a second serving stack; removed. Re-test if SYCL/Mesa improve.
+Mesa: 26.0.8 in the container; no newer build available for Ubuntu 26.04 yet.
+Realistic ceiling of all software/firmware fixes on this box: ~1.5-2x today. A different memory bus
+  (Strix Halo, an Apple M-series Pro, a discrete GPU) is what changes the league.
+
+
+11. FAST PATH BUILD: 2026-09-19 (commands answered without the LLM)
+------------------------------------------------------------------
+Layers, cheapest first (all measured through the Casa AI pipeline):
+  1. Aliases on 41 entities incl. STT/accent variants of people's names and device names, applied from a JSON file.
+     A light bar that had never been exposed to Assist was exposed.
+  2. Sentence templates custom_sentences/en/casa_fast.yaml (HassLightSet / HassTurnOn / HassTurnOff for names,
+     areas, scenes, covers; "dim X to N", "X at N percent", "N percent on X", "X off please", "kill the X",
+     "everything off in <area>", "movie mode", "lower/raise the blinds"...). Reload: action conversation.reload.
+     Responses defined in the same file ("Set to N percent" / "Done").
+  3. Assist Canonicalizer 1.14.0 (HACS; fallback agent conversation.casa, min_confidence 0.5, min_margin 0.04) = the
+     Casa AI pipeline's agent (prefer_local_intents still on: exact matcher → Canonicalizer → Casa). Handles
+     typos/STT garbage AND makes state questions local ("is Jon's light on?" 0.1 s, temperature 0.0 s).
+  4. assist-learn (ai-eval/assist_learn.py on a 5-min systemd timer): phrases that still reached the LLM + what it did
+     → add aliases/templates. HA only keeps the last 10 debug runs per pipeline, hence the 5-min poll.
+Results: 20/22 test phrasings local at 0.0-0.2 s before the Canonicalizer; with it, garbled inputs
+  ("switch of the sofa lights", a misspelled desk light, "turn on the Sofia light") 0.1-0.4 s and questions local.
+  Still LLM: vague requests ("it's a bit dark..."), general knowledge, very garbled text.
+Un-exposed from Assist: duplicates and legacy wrappers that made the matcher ask "which one?" (duplicate switches for
+  the same device, unnamed Music Assistant / AirPlay players, the Echo Shows' own media players, "Do not disturb"
+  switches, a duplicate shopping list). 57 entities exposed after that.
+TESTING RULE: test on a room nobody is using, never where someone is working.
+
+
+12. OPEN WEBUI "CASA" CHAT: 2026-09-19 (the phone chat; its code is not in this repo)
+-----------------------------------------------------------------------------------
+Open WebUI in its own container (Docker, LAN/VPN only, signups closed). One model entry "Casa" = a pipe function.
+Routing per message:
+  photo -> Ollama "chat" (gemma3, vision)                                            ~20 s
+  HA local matcher (conversation.home_assistant) matched -> its answer, no model    0.0-0.2 s
+  house-sounding text -> conversation.assist_canonicalizer                           0.1 s local / ~20 s if Casa LLM
+  else -> granite4.2:3b with rules + a short profile + top-3 memories + tools        3-8 s (+ ~5 s per tool)
+Tools: house(request), a server-status tool, remember(fact) [Open WebUI memory store].
+Memory recall = query_memory top-3 injected into the system prompt (Open WebUI's own injection does not reach
+pipes called via the API). Measured: commands 0.0-0.1 s, Mona Lisa 7 s, server status 7 s, remember 6 s, recall 3.7 s,
+"it's a bit dark in the bedroom" 22 s (was 63 s before the house shortcut).
+Gotchas: aiohttp session must outlive the returned async generator; Users.get_user_by_id is async in this
+Open WebUI build.
+
+
+13. TYPOS, QUESTIONS AND CACHE SLOTS: 2026-09-19 evening
+--------------------------------------------------------
+- The Canonicalizer turned a typo'd QUESTION into an ACTION ("is the montor light on?" → "Turned on the light"):
+  its closest candidate was a command. Fixes: (a) the chat pipe corrects one-off typos in device/room/command words
+  BEFORE the exact matcher (difflib against a vocabulary built from HA friendly names + aliases + command words,
+  cutoff 0.8, refreshed every 10 min) so the exact matcher decides question vs command; (b) Canonicalizer
+  min_confidence 0.5 → 0.62 so garbled input falls to the model instead of guessing an action; (c) area aliases
+  ("bedroom", "bathroom", "closet", "entry"...); (d) templates for "of" typos, "would you mind turning", "tell me if
+  X is on", "what's the status of X", "how warm is it in <area>"; (e) "hey/hi/ok casa ..." and trailing
+  "please/thanks" stripped before matching.
+  Result: typo'd commands and questions 0.0-0.3 s, questions stay questions. Still model-bound: "what's the
+  temperature in the <room without thermostat>" (HA's built-in climate sentence wins over the custom one).
+- Slow first replies: memory recall embeds via nomic-embed-text; with OLLAMA_MAX_LOADED_MODELS=2 that evicted a
+  model every turn → now 3 resident (granite + chat + nomic, keep-warm loads all three).
+- 46-67 s house answers: granite's runner had 2 cache slots for 3 prompts (house 5k tokens, chat brain, keep-warm);
+  overlaps evicted the house prompt (40 s rebuild). OLLAMA_NUM_PARALLEL=3 (slot chosen by prefix similarity).
+- Leaked "</think>" + duplicated text from granite in the chat: the pipe strips think blocks (also mid-stream).
+- General questions in the chat: granite refuses people's physical attributes ("what is Obama's height" →
+  "I don't have that information", curly apostrophe!) and the tool-heavy rules made it conservative. Now: rules
+  say it is a knowledgeable general assistant, temperature 0.2, and a refusal detector re-asks the question plainly
+  on the gemma "chat" model. Obama 6'1" OK, Messi 1.75 m OK, but "Taylor Swift born 1999" (wrong: 1989): 3B facts
+  are unreliable; the real fix = local web search (SearXNG) or the 26B for "smart mode".
+
+
+14. CASA CHAT SCENARIO MATRIX: 2026-09-19 night (what handles what, measured)
+----------------------------------------------------------------------------
+Routing inside the chat pipe (in this order; first hit wins):
+  photo                                  -> gemma "chat" (vision)                          ~20 s, streamed
+  weather/forecast/rain/umbrella         -> HA weather entity + get_forecasts, formatted in code   0.0 s
+  HA exact matcher (after typo fix)      -> commands, state questions, time, date, add to list  0.0-0.3 s
+  house words (light/blind/bedroom…)     -> Canonicalizer (fuzzy) -> HA Casa LLM if needed      0.1 s / ~15-20 s
+  "days until <holiday>"                 -> computed in code                                     0.0 s
+  FACT_RE (who/when/where, how far/tall/old/…, born/price/latest/news/population/capital/…)
+                                         -> SearXNG snippets (5) -> granite answers with source  4-10 s
+        "how old is X"                   -> birth date parsed from snippets, age computed in code 1-3 s
+        news/headlines                   -> SearXNG news category (day), fallback normal search; 3 headlines
+  translate / how do you say / what does X mean -> gemma, plain translator prompt, streamed      3-9 s
+  everything else                        -> granite brain: rules + profile + top-3 memories + today's date,
+                                            tools, streamed; chatty/creative requests (recipe, write, explain,
+                                            joke…) run WITHOUT tools; refusals re-asked on gemma.
+Measured: weather 0.0 s · date/time 0.0 s · shopping list 4.5 s · timer 6 s · a public figure's age 3 s (correct) ·
+city-to-city distance 9 s · an address lookup 10 s · CEO of Intel 8 s · news 8 s · translation 4-9 s ·
+guacamole recipe first token ~4 s (streamed) · "send me that recipe on my phone" 17 s (two turns).
+Known limits: a 3B brain still hallucinates numbers it does not look up; SearXNG news engines are flaky.
+- 2026-09-20: links + discovery lanes. Real links come from SearXNG (1-3 s, no model); the model never writes links
+  (small models invent URLs). Recipe first token 3 s / total 17 s; "best pizza" 21 s; "laptop under $1000" 10 s.
+- 2026-09-20: Ollama trimmed to granite4.2:3b + chat + nomic-embed-text (qwen3.5:4b and gemma4:26b removed).
+
+
+15. SPEED TUNING PASS: 2026-09-20
+--------------------------------
+Measured floor on this hardware: granite 10.5 tok/s generation, ~215-270 tok/s prompt reading; a 300-character answer
+costs ~7 s of generation no matter what: the pipe's job is to avoid the model or shorten what it writes.
+Helped:
+- Open WebUI background tasks (title/tags/follow-ups/query generation) ran THROUGH the Casa pipe after every reply
+  (TASK_MODEL was empty = current model): now TASK_MODEL=chat:latest, only title generation on (3 hidden model runs
+  per chat removed).
+- The chat container was CPU-starved (load 3.9 on 2 cores while Open WebUI + SearXNG worked): 4 cores now (load ~2).
+- SearXNG waited up to 3 s for engines that never answer: disabled; request_timeout 2 s. Search 3.0 s → 0.3-0.9 s.
+- Per-lane output caps: search answers 140 tokens, translations 120, brain turns 320, options quick-version 170;
+  search snippets 200 chars.
+- Server-status tool output compacted (600 → ~60 tokens): 13 s → 6.7 s warm.
+No effect (tested, left off): OLLAMA_FLASH_ATTENTION (10.5-12.2 tok/s either way), num_batch 512/1024/2048 (215 tok/s
+each). Not applicable here: speculative decoding (no Ollama support), KV quantization (memory only).
+Operational rule: after ANY Ollama restart re-warm the Casa prompt (stt/ollama-keepwarm.sh), or the next voice
+command pays ~40 s of cold prompt reading; and the GPU is shared, so a chat answer running at the same time drops to
+~1.7 tok/s (the 51 s outlier seen that day).
+Warm numbers after tuning: capital of Peru 1.8 s · a footballer's age 0.4 s · weather 0.0 s · dessert idea 5.5 s ·
+a long driving-distance answer 7.8 s · server status 6.7 s.
+- "Quick Google" lane: FACT questions are rewritten to keyword queries ("how far is A from B by car" → "A to B
+  distance miles", "what is X's birthday" → "X born date"), results pass a relevance check (some engines fixate on
+  the first word), and numeric answers are EXTRACTED IN CODE (distance, drive time, height in ft/in or metres,
+  birthday with age, population). Model answers capped at 90 tokens / 20 words. Timings: distances 0.7-1.0 s, a
+  landmark 0.7 s, a birthday 0.8 s, news 1.2 s, a CEO 3.0 s.
+- Search answers ~1-2.5 s warm: search + Wikipedia summary fetched IN PARALLEL (asyncio.gather), the model gets a
+  tiny context (wiki summary + 3 snippets x 150 chars, ~120 tokens) and replies with the bare answer phrase (max 10
+  words, 40 tokens). Target: nothing over ~2.5 s for quick facts, 4 s worst.
+- Two hidden causes of 40-70 s house answers, both fixed:
+  (a) the keep-warm pinged conversation.casa DIRECTLY, but real requests reach Casa through the Canonicalizer and
+      that path renders a different prompt (only 3 common tokens), so the ping warmed a shape nobody used. Now the
+      ping goes to conversation.assist_canonicalizer with a text it cannot match ("ping"): the same prompt shape.
+  (b) OLLAMA_NUM_PARALLEL=4 made Ollama's memory ESTIMATE (slots x num_ctx) exceed the 20 GB cap: it evicted and
+      reloaded models on every request. Back to 3 slots; the small granite lanes share a common first line so they
+      occupy ONE cache slot: slots = house prompt / brain / small lanes. Verified: mixed sequence, 0 evictions.
+  Rule: watch `journalctl -u ollama | grep -E "evicting|task 0"` after any change; "predicted_num_ctx" = slots x ctx.
+- Where a fact question's time goes in the browser: Open WebUI pre-processing ~0.05 s, search 0.6 s, model 1.0-1.6 s
+  (reading ~250 new snippet tokens at ~225 tok/s + a 3-token answer), UI socket/render ~0.7 s, so ~2.5-3 s visible.
+
+
+16. LOCAL "COMFORT" INTENTS: 2026-09-20 afternoon (human requests answered without the LLM)
+-------------------------------------------------------------------------------------------
+intent_script + custom sentences (voice AND chat):
+  CasaTooBright / CasaTooDark  "it's too bright / a bit dark in the <area>", "dim the bedroom a bit" → lights that
+                               are ON step ±30 % (dark + all off → on at 60 %)
+  CasaTooCold / CasaTooHot     "it's cold in here", "make it warmer", "turn up the heat" → thermostat ±1 °C
+  CasaTooLoud / CasaTooQuiet   "it's too loud [in the bedroom]", "turn the music down a bit", "louder" → ±10 % per player
+  CasaCozy                     "make it cozy / romantic / chill" → lights on → 30 %
+  CasaScene                    "I'm going to bed / good night", "we're leaving", "I'm working", "dinner's ready",
+                               "let's watch a movie" → the matching scene
+  CasaCooking / CasaDryAir     kitchen lights 100 % / humidifier on
+All measured 0.0-0.3 s (typo'd "biright" 0.9 s via the Canonicalizer). intent_script needed an HA RESTART to load the
+first time (new domain; later edits reload with intent_script.reload). YAML gotcha: a colon inside an unquoted
+`description:` breaks the package. Matching can be dry-run with the WS command conversation/agent/homeassistant/debug
+(no execution): ai-eval/match_test.py.
+
+
+17. MEMORY INCIDENT + SAFETY NET: 2026-09-20 afternoon
+------------------------------------------------------
+HA Core was OOM-killed (exit 137, anon-rss 2.5 GB) inside the HA VM, which only had ~3.8 GB: the VM is memory 8192 /
+balloon 4096 and the HOST was out of RAM (MemAvailable 2.6 GB of 32): Ollama's iGPU buffers are host shared memory
+(Shmem 12.4 GB with three models resident and 3 cache slots x 16k ctx). Core's growth came from hundreds of test
+conversations (conversation.reload does NOT leak: +1 MB each).
+Fixes: granite num_ctx 16384 → 12288 (later reverted, see below), gemma lanes 4096, gemma "chat" no longer kept warm
+(keep_alive 2h, reload ≈ 3 s on the first photo after idle), HA VM balloon 4096 → 5120. Result: host MemAvailable
+12.5 GB, Shmem 5.9 GB, HA VM 5.2 GB. Guard automations: warn at >60 % for 15 min, restart Core at night if >45 %,
+restart immediately if >75 % for 5 min.
+REGRESSION FOUND AND REVERTED: granite4.2:3b at num_ctx 12288 outputs garbage ("Would Let Let Let...") on the
+Vulkan backend; 16384 is fine. Every granite caller must use 16384: Ollama reloads the model on any num_ctx change.
+
+
+=====================================================================================================
+ADDENDUM 2026-09-20/21: VOICE LATENCY, STT/TTS BENCHMARKS, casa-stt
+=====================================================================================================
+Why the Echo felt slow: the pipeline's "stt" stage spans wake → transcript, i.e. the time you are TALKING (2–3 s)
++ the end-of-speech silence wait (0.7 s default) + the transcription itself. STT on the HA VM (4 vCPU, Whisper
+small-int8) took ~5-7 s per utterance end to end and was the largest voice latency component.
+Transcription alone (ai-eval/stt_bench.py, 32 clips × clean/far-field, HA VM 4 vCPU):
+
+  engine (core_whisper 3.5.3)     latency after end of audio   WER clean / noisy
+  parakeet-tdt-0.6b-v3 (sherpa)   0.60 s avg, p90 0.72 s       2.4% / 3.8%   <- chosen first
+  zipformer streaming (Kroko)     0.17 s avg, p90 0.22 s       12% / 11% (numbers as words, name garbles)
+  whisper small-int8 (before)     1.13 s avg, p90 1.49 s       3.8% / 8.9%
+  whisper base-int8               0.43 s                       7.0% / 10%
+  whisper distil-small.en         1.71 s                       7.1% / 7.6%
+  vad_clip=true made parakeet SLOWER (adds a VAD pass) → off. beam_size/initial_prompt only apply to
+  faster-whisper (parakeet ignores them).
+Piper (en_US-lessac-medium) is NOT a bottleneck: first audio 0.06–0.17 s, 24x realtime (tts_bench.py).
+Options NOT taken: Whisper on the Arc iGPU inside the HA VM (the iGPU belongs to the voice host); Speech-to-Phrase
+(fastest, but closed vocabulary = no questions); more vCPUs for the HA VM.
+
+casa-stt (2026-09-21): own Wyoming STT on the voice host :10310 = Kroko streaming (beam 4 + hotwords + number/name
+normalisation) → HA matcher check (match:true) → else the accurate engine. Real-time bench: 0.27/0.33 s avg latency,
+WER 0.5 % clean / 1.6 % noisy. Details in stt/README.md and STT_TTS_BENCHMARKS.md.
+
+First real Echo tests of casa-stt, and what they taught:
+  * The FIRST WORD ("turn") was missing from the audio itself: VACA mutes the mic while its wake sound plays, so the
+    ~1 s "Ding" swallowed anything said during it. A custom 210 ms "blip" first, then VACA patch v2 (no mic mute at
+    all during the blip; vaca-patch/).
+  * "Responses after a minute": the Casa conversation context grew 5.5k → 13k tokens across an evening (max_history
+    20 kept every tool round of every fuzzy command; each LLM turn then cost 50–80 s and new wake-ups queued behind
+    it). max_history 4, later 2.
+  * Far-field audio degrades consonants: "monitor light" → "moment"/"monitor lie/like/line", "turn" → "tone/tune",
+    people's names → look-alike words. casa-stt repairs transcripts (confusion table + unmatched-slot → closest house
+    phrase + vocabulary), validated by the HA matcher; Parakeet fragments ("20%.") no longer win over a better
+    streaming text.
+  * The LLM acting on fragments is dangerous ("20%." set a light to 20 %): repair + matcher gate avoids most of it.
+  * Speakers clip the first ~0.5 s of an HTTP stream: self-test clips need ≥1.5 s lead-in silence.
+  * Self-test runs (ai-eval/voice_selftest.py): 7/20 before the fixes, 14/30 after; misses were misheard names and
+    wake-word misses (~20 % of speaker plays), never the fast path itself.
+  * A runaway 3,300-token generation froze the Echo for 12 min → ollama-guard caps num_predict at 400 for every HA
+    request (stt/ollama_guard.py). Deriving a model with `ollama create … FROM granite4.2:3b` + PARAMETERs lost
+    granite's chat template (TEMPLATE {{ .Prompt }}) and the copy emitted garbage: never feed
+    `ollama show --modelfile` output back into `ollama create` for renderer-based models.
+  * Garbled house commands now get "Sorry, I didn't catch that" in <1 s instead of a 30–60 s LLM turn that blocks the
+    Echo; questions and general requests still reach the LLM.
+  * DEEP DIVE "recordings sound fine, transcripts are bad": 13 real utterances through every engine. Kroko streaming
+    8/13 wrong; Parakeet TDT '' or nonsense on 6/13; Whisper small wrong on the hard ones; Whisper medium correct on
+    all. Root cause = accent: the small/streaming models were trained on far less accented English than Whisper
+    medium. whisper.cpp medium q5_0 on the Arc iGPU (Vulkan) = 1.8 s encode at full 30 s context, 0.3 s with -ac 512
+    → ~1.0–1.3 s total per phrase; -nf avoids 10–30 s decoder loops; names-only prompts bias "height" → "light", a
+    natural sentence prompt works. casa-stt stage 2 = whisper-server (:10320), Parakeet optional.
+
+iGPU HANGS (2026-09-21 onwards): the Arc iGPU hung under compute ("Fence expiration time out i915 … llama-server",
+"GPU HANG … context reset"). The same 7k-token HA request is CORRECT on CPU (num_gpu 0, 528 s) and garbage/empty on
+Vulkan. After a hang Ollama keeps answering 200s with EMPTY content (eval 1 token) until restarted: HA then says
+"Unable to get response". → ollama-health.sh on a 5-min timer asks for "pong"; two bad replies in a row restart
+Ollama (stt/). Later (2026-09-24): 76 hangs in 4 days, nearly all at :01/:31 = the 30-min keep-warm sending the
+~10k-token Casa prompt (granite is hybrid/recurrent, so Ollama can't reuse its prompt cache and the ping warmed
+nothing) → keep-warm removed; and the i915 watchdog (heartbeat 2.5 s, preempt 7.5 s) kills long compute batches → a
+host service sets the compute engines' heartbeat to 0 and preempt timeout to 30 s at boot. ollama-health skips
+while a request is open and keeps keep_alive 24h.
+
+Voice brain (2026-09-26): tier 1 stays local and free (casa-stt stream matcher + canonicalizer HassIL/fuzzy + local
+intents: lights, timers, weather, music; 0.05–0.4 s). Anything tier 1 can't match goes to Claude Haiku 4.5 through
+HA's Anthropic integration (Control Home Assistant = Assist, 63 exposed entities, prompt caching automatic, max_tokens
+400, no thinking, Anthropic web search off; a local SearXNG search script instead, 0.6 s). Measured (text): advice
+questions 1.4–2.2 s full answer, follow-ups 1.4–1.8 s, live question with search ~3 s, rephrased house commands
+1.4–1.9 s; cost ≈ $0.0005/question. Failover: Claude error → conversation.casa_brain (local granite).
+Local LLM on 6 complex advice questions: 3.2–8.0 s, answers shallow and sometimes wrong (sour French-press coffee
+blamed on over-extraction): that is why open questions go to Claude, and commands never go to the local model.

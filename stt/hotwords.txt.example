@@ -1,0 +1,42 @@
+# casa-stt hotwords: generate the plain phrases with stt/make_hotwords.py, then add the hand-written sections below.
+# Plain line = a phrase the streaming model should favour (optional " :score", default CASA_STT_HOTWORDS_SCORE).
+Monitor Light
+Desk Lamp
+Sofa Light
+Living Room
+Bedroom Pendant
+Thermostat
+Movie Night
+Good Night
+# command openers, boosted harder (accented onsets: "journal" for "turn on")
+turn on :3
+turn off :3
+turn on the :3
+turn off the :3
+switch on :2.5
+switch off :2.5
+dim the :2.5
+set the :2.5
+light :2
+lights :2
+timer :2
+minute timer :2
+# spelling fixes applied to every transcript (wrong => right), e.g. a name the model always spells another way
+John => Jon
+chill out => Chillout
+# repair-only confusions: tried only when a sentence does not match a command; HA's matcher validates the result
+~ like => light
+~ lie => light
+~ line => light
+~ tone of => turn off
+~ tone on => turn on
+~ tune on => turn on
+~ turn of => turn off
+~ journal => turn on
+~ the moment => the monitor
+~ molecule => monitor
+~ urn on => turn on
+~ urn off => turn off
+~ timber => timer
+~ said a timer => set a timer
+~ contact of light => countertop light

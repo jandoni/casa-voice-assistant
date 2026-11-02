@@ -1,0 +1,12 @@
+{
+  "domain": "casa_weather",
+  "name": "Casa weather",
+  "version": "1.0.0",
+  "documentation": "https://github.com/jandoni/casa-voice-assistant",
+  "dependencies": [
+    "intent",
+    "weather"
+  ],
+  "codeowners": [],
+  "iot_class": "local_push"
+}

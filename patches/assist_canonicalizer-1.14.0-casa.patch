@@ -1,0 +1,391 @@
+--- a/custom_components/assist_canonicalizer/conversation.py
++++ b/custom_components/assist_canonicalizer/conversation.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import dataclasses
+ import contextlib
+ import contextvars
+ import hashlib
+@@ -23,7 +24,7 @@
+ )
+ from homeassistant.config_entries import ConfigEntry
+ from homeassistant.const import MATCH_ALL
+-from homeassistant.core import HomeAssistant
++from homeassistant.core import HomeAssistant, callback
+ from homeassistant.helpers import intent
+ 
+ if TYPE_CHECKING:
+@@ -69,7 +70,127 @@
+ )
+ 
+ _LOGGER = logging.getLogger(__name__)
++
++# Casa patch 2026-09-23: never read an error out loud. A local-LLM failure (e.g. the iGPU on the voice host hanging:
++# "llama-server chat error: map[code:500 message:decode() failed: vk::Device::waitForFences: ErrorDeviceLost ...]")
++# used to be spoken verbatim after ~80 s. Now: short fixed sentences, the full text goes to the log/logbook and a
++# `casa_voice_error` event for later review, and a request that takes longer than CASA_TIMEOUT_S is abandoned.
++import re as _re
++
++CASA_TIMEOUT_S = 25
++_CASA_TV_ENTITY = "media_player.living_room_tv"   # the TV whose dialogue reaches the Echos (TV-silence rule)
++
++
++class _CasaCancelled(Exception):
++    """The dashboard's X cancelled the running voice request."""
++# Casa patch 2026-09-24: the dashboard X can be pressed BEFORE the request reaches us (still listening / in STT); the
++# live cancel event is then missed and the old request came back 3-15 s later ("thinking" again, then an answer).
++# So remember, per Echo, when the X was pressed and when its satellite last started listening: a request whose
++# listening started before the last X is dropped silently, whenever it arrives.
++_CASA_CANCEL_AT: dict[str, float] = {}   # VACA device id -> monotonic time of the last X
++_CASA_LAST_TURN: dict[str, tuple] = {}  # VACA id -> (reply re-opened the mic, monotonic time)
++_CASA_LISTEN_AT: dict[str, float] = {}   # VACA id -> monotonic time its satellite last went to "listening"
++_CASA_TRACKING: list = []
++
++
++def _casa_track(hass) -> None:
++    if _CASA_TRACKING:
++        return
++    _CASA_TRACKING.append(True)
++
++    @callback
++    def _on_cancel(event) -> None:
++        _CASA_CANCEL_AT[str(event.data.get("dev") or "")] = time.monotonic()
++
++    @callback
++    def _on_state(event) -> None:
++        new = event.data.get("new_state")
++        eid = event.data.get("entity_id", "")
++        if new is not None and new.state == "listening" and eid.startswith("assist_satellite.vaca_"):
++            _CASA_LISTEN_AT[eid.split("vaca_", 1)[1]] = time.monotonic()
++
++    @callback
++    def _satellites_only(data) -> bool:
++        # HA requires the event filter to be a @callback (a plain lambda raised on the first request after every
++        # restart - and that exception text was SPOKEN by the Echo; fixed 2026-09-25)
++        return str(data.get("entity_id", "")).startswith("assist_satellite.vaca_")
++
++    hass.bus.async_listen("casa_voice_cancel", _on_cancel)
++    hass.bus.async_listen("state_changed", _on_state, event_filter=_satellites_only)
++
++
++def _casa_vaca_id(hass, device_id) -> str | None:
++    if not device_id:
++        return None
++    for ent in entity_registry.async_entries_for_device(entity_registry.async_get(hass), device_id):
++        if ent.entity_id.startswith("assist_satellite.vaca_"):
++            return ent.entity_id.split("vaca_", 1)[1]
++    return None
++
++
++def _casa_was_cancelled(hass, user_input) -> bool:
++    dev = _casa_vaca_id(hass, getattr(user_input, "device_id", None))
++    if not dev or dev not in _CASA_CANCEL_AT:
++        return False
++    cancelled = _CASA_CANCEL_AT[dev]
++    return time.monotonic() - cancelled < 120 and cancelled > _CASA_LISTEN_AT.get(dev, 0.0)
++
++
++CASA_SAY_ERROR = "Sorry, something went wrong. Please try again."
++CASA_SAY_TIMEOUT = "Sorry, that took too long. Please try again."
++_CASA_TECHNICAL = _re.compile(
++    r"status code|map\[|traceback|exception|server_error|vk::|errordevicelost|errno|\bhttp \d{3}\b|"
++    r"connection (refused|reset|error)|timed? ?out|failed:|chat error|llama-server|ollama|decode\(\)",
++    _re.IGNORECASE,
++)
++
++
++def _casa_speech(result) -> str:
++    try:
++        sp = result.response.speech.get("plain", {}).get("speech", "") if result and result.response else ""
++        return sp if isinstance(sp, str) else ""
++    except Exception:  # noqa: BLE001
++        return ""
+ 
++_CASA_LOCAL_BRAIN = "conversation.casa_brain"
++# Casa patch 2026-09-28: a conversation keeps going (like ChatGPT / Alexa+ voice mode): after the LLM answered a
++# QUESTION or a chat turn, the Echo listens again without a wake word. House commands ("turn off…", "set a timer…",
++# "play…") still end at once. Silence / TV / people talking end the conversation silently (follow-up guard below).
++# (2026-09-28) several house commands in one sentence: "turn off the monitor light and turn on the desk lamp",
++# "turn off the countertop and set the thermostat to 20". Split on and / then / also; a part without its own verb borrows
++# the previous one ("turn off the monitor and the desk lamp") but only when it names a device - so "set a timer for
++# 1 hour and 30 minutes" or "play rock and roll" never split.
++_MULTI_SEP_RE = _re.compile(r"\s*,?\s+(?:and then|and also|and|then|also|plus)\s+|\s*[,;]\s+(?=(?:please\s+)?(?:turn|switch|set|dim|brighten|open|close|start|stop|lock|unlock|play|pause)\b)", _re.I)
++_MULTI_VERB_RE = _re.compile(r"^\W*(?:(?:please|can you|could you|and)\s+)*((?:turn|switch)\s+(?:on|off)|turn|switch|set|dim|brighten|open|close|start|stop|lock|unlock|put|play|pause|resume|skip)\b", _re.I)
++_MULTI_DEVICE_RE = _re.compile(r"\b(lights?|lamps?|monitor|desk|sofa|overhead|countertop|counter|kitchen|dining|hallway|entry|corridor|ceiling|pendant|"
++                              r"mirror|vanity|closets?|wardrobe|walk-in|hatch|thermostat|heat(?:ing)?|temperature|ac|fan|scent|diffuser|blinds?|tv|music|"
++                              r"humidifier|bedroom|office|living|degrees)\b", _re.I)
++
++
++def _casa_split_multi(text: str) -> list:
++    if not text or not _MULTI_VERB_RE.match(text):
++        return [text]
++    raw = [p.strip(" ,.;") for p in _MULTI_SEP_RE.split(text) if p and p.strip(" ,.;")]
++    if len(raw) < 2:
++        return [text]
++    out, verb = [], None
++    for p in raw:
++        m = _MULTI_VERB_RE.match(p)
++        if m:
++            verb = m.group(1)
++            out.append(p)
++        elif verb and _MULTI_DEVICE_RE.search(p):
++            out.append(f"{verb} {p}")
++        else:
++            return [text]
++    return out
++
++
++_CASA_LLM_RESULTS: set[int] = set()   # id(user_input) of requests the fallback LLM answered (removed when the request ends)
++_CASA_COMMAND_RE = _re.compile(
++    r"^\s*(?:(?:please|can you|could you|would you|hey)\s+)*(?:turn|switch|set|dim|brighten|open|close|lock|unlock|start|stop|"
++    r"pause|resume|play|skip|next|previous|cancel|add|remove|put|make it|raise|lower|increase|decrease|mute|unmute|activate|run)\b",
++    _re.I)
+ _ASYNC_CONVERSE_PARAMETERS = frozenset(inspect.signature(conversation.async_converse).parameters)
+ type ChatLogDelta = dict[str, object]
+ 
+@@ -249,16 +370,124 @@
+             last_request_id=request_id,
+         )
+         try:
+-            result = await self._async_process_with_runtime(user_input)
++            _casa_track(self.hass)
++            dropped = _casa_was_cancelled(self.hass, user_input)
++        except Exception as err:  # noqa: BLE001 - bookkeeping must never break (or be read out in) a request
++            _LOGGER.warning("Casa voice: cancel tracking failed: %s", err)
++            dropped = False
++        if dropped:
++            _LOGGER.info("Casa voice: dropped a request from before the X: %r", getattr(user_input, "text", ""))
++            return self._spoken_result(user_input, "")
++        # Casa voice lab (2026-09-26, voice-lab/): while input_boolean.casa_voice_lab is on, report what was
++        # heard and do NOTHING (no action, no LLM, silent) - lets the lab replay test clips without side effects.
++        if self.hass.states.is_state("input_boolean.casa_voice_lab", "on"):
++            self.hass.bus.async_fire("casa_lab_result", {
++                "text": getattr(user_input, "text", "") or "",
++                "dev": _casa_vaca_id(self.hass, getattr(user_input, "device_id", None)) or ""})
++            return self._spoken_result(user_input, "")
++        try:
++            parts = _casa_split_multi((getattr(user_input, "text", "") or "").strip())
++            if len(parts) > 1:
++                result = await self._casa_multi(user_input, parts)
++            else:
++                result = await self._casa_run_cancellable(user_input)
++        except _CasaCancelled:
++            self._runtime.update_diagnostics(last_query_latency_ms=elapsed_ms(started_at), last_error="cancelled by the X")
++            _LOGGER.info("Casa voice request cancelled from the dashboard: %r", getattr(user_input, "text", ""))
++            return self._spoken_result(user_input, "")
++        except asyncio.TimeoutError:
++            self._runtime.update_diagnostics(
++                last_query_latency_ms=elapsed_ms(started_at),
++                last_error=f"timeout after {CASA_TIMEOUT_S}s",
++            )
++            self._casa_report(user_input, f"timeout after {CASA_TIMEOUT_S}s")
++            return self._spoken_result(user_input, CASA_SAY_TIMEOUT)
+         except Exception as err:
+             self._runtime.update_diagnostics(
+                 last_query_latency_ms=elapsed_ms(started_at),
+                 last_fallback_reason=FallbackReason.UNEXPECTED_EXCEPTION,
+                 last_error=str(err),
+             )
+-            return self._error_result(user_input, str(err))
++            self._casa_report(user_input, f"exception: {err!r}")
++            return self._spoken_result(user_input, CASA_SAY_ERROR)
+         self._runtime.update_diagnostics(last_query_latency_ms=elapsed_ms(started_at))
++        # an error result, or an "answer" that is really a technical error string -> short sentence, log the rest
++        speech = _casa_speech(result)
++        is_error = False
++        with contextlib.suppress(Exception):
++            is_error = result.response.response_type == intent.IntentResponseType.ERROR
++        if (is_error and speech and not speech.strip().endswith("?")) or (speech and _CASA_TECHNICAL.search(speech)):
++            self._casa_report(user_input, speech)
++            return self._spoken_result(user_input, CASA_SAY_ERROR)
++        # Casa patch 2026-09-26: follow-up turns (the mic re-opened after our last reply, no wake word) must never
++        # loop on background speech: Claude answers only an ellipsis (silent) to words not meant for it (its prompt), and a follow-up
++        # that wasn't understood ends silently instead of "Sorry, I didn't catch that. Could you say it again?"
++        dev = _casa_vaca_id(self.hass, getattr(user_input, "device_id", None)) or ""
++        from_llm = id(user_input) in _CASA_LLM_RESULTS
++        _CASA_LLM_RESULTS.discard(id(user_input))
++        last = _CASA_LAST_TURN.get(dev)
++        followup = bool(last and last[0] and time.monotonic() - last[1] < 30)
++        _CASA_LAST_TURN.pop(dev, None)
++        text_in = (getattr(user_input, "text", "") or "").strip().lower()
++        # (2026-10-01) while the TV plays, a fresh wake that was not understood / not meant for Casa was the TV
++        # (the Echos in the other rooms hear its dialogue through the walls): end silently - no "Sorry, could you repeat?",
++        # no answer to a line of film dialogue.
++        tv_on = False
++        with contextlib.suppress(Exception):
++            atv = self.hass.states.get(_CASA_TV_ENTITY)
++            tv_on = bool(atv and atv.state == "playing")
++        if (not followup and tv_on and (speech.strip() in ("…", "...", "[ignore]") or text_in in ("", "casa did not understand")
++                                        or "didn't catch that" in speech.lower() or "missed part of that" in speech.lower())):
++            _LOGGER.info("Casa: TV playing, wake not meant for us (%r) - silent", text_in)
++            self.hass.bus.async_fire("casa_conversation_end", {"dev": dev, "reason": "tv"})
++            return self._spoken_result(user_input, "")
++        if not followup and speech.strip() in ("…", "...", "[ignore]"):
++            # (2026-09-26) outside a follow-up the "not meant for me" answer is never right: it was a cut-off question
++            return self._spoken_result(user_input, "Sorry, I missed part of that. Could you say it again?")
++        if speech.strip() in ("…", "...", "[ignore]") or (followup and (text_in in ("", "casa did not understand") or "didn't catch that" in speech.lower())):
++            _LOGGER.info("Casa: follow-up not for us (%r) - ending the conversation silently", text_in)
++            self.hass.bus.async_fire("casa_conversation_end", {"dev": dev, "reason": "ignored"})
++            return self._spoken_result(user_input, "")
++        # Casa patch 2026-09-21: like the LLM agents, keep the satellite listening (no new wake word) when the
++        # local answer is a question - e.g. "Sorry, I didn't catch that. Could you say it again?"
++        try:
++            if isinstance(speech, str) and speech.strip().endswith("?"):
++                result.continue_conversation = True
++            # (2026-09-28) the LLM answered a question / chat turn (not a house command) -> keep the conversation open
++            elif from_llm and speech.strip() and not _CASA_COMMAND_RE.match(text_in):
++                result.continue_conversation = True
++            if getattr(result, "continue_conversation", False) and dev:
++                _CASA_LAST_TURN[dev] = (True, time.monotonic())
++        except Exception:  # noqa: BLE001
++            pass
++        # (2026-09-28) the Echo screen shows the reply from sensor.vaca_*_tts, whose state is cut at 255 characters
++        # ("…and re.."): send the whole text to the dashboard too (echo-home.js picks it up by prefix)
++        with contextlib.suppress(Exception):
++            if speech and len(speech) > 200:
++                self.hass.bus.async_fire("casa_reply", {"dev": dev, "text": speech})
+         return result
++
++    async def _casa_multi(self, user_input: ConversationInput, parts: list) -> ConversationResult:
++        """(2026-09-28) several commands in one sentence: every part runs at the same time through the normal path (local
++        first, the LLM only for a part nothing local understands); the replies are joined into one sentence."""
++        subs = [dataclasses.replace(user_input, text=p) for p in parts]
++        results = await asyncio.gather(*(self._casa_run_cancellable(s) for s in subs), return_exceptions=True)
++        said = []
++        for part, r in zip(parts, results):
++            if isinstance(r, _CasaCancelled):
++                raise r
++            if isinstance(r, BaseException):
++                _LOGGER.warning("Casa multi: %r failed: %s", part, r)
++                said.append(f"I couldn't do “{part}”")
++                continue
++            sp = (_casa_speech(r) or "").strip().rstrip(".")
++            if sp and sp not in ("…", "..."):
++                said.append(sp)
++        _LOGGER.info("Casa multi: %d parts %r -> %r", len(parts), parts, said)
++        if not said:
++            return self._spoken_result(user_input, "Done.")
++        text = said[0] + "".join((", " if i < len(said) - 1 else " and ") + (x[0].lower() + x[1:]) for i, x in enumerate(said[1:], 1))
++        return self._spoken_result(user_input, text + ".")
+ 
+     async def async_prepare(self, language: str | None = None) -> None:
+         """Prepare the agent for a language."""
+@@ -377,6 +606,11 @@
+             if self._result_has_error(result):
+                 self._restore_chat_log_content(chat_log, old_len)
+                 return result if return_error_result else None
++            if self._casa_bogus_who(text, result):
++                # Casa patch 2026-09-24: HA's built-in "who is [in] [the] {zone}" takes ANY words as the zone, so
++                # "who is the president of France" answered "Not any". Not a real zone -> not ours: let the LLM answer.
++                self._restore_chat_log_content(chat_log, old_len)
++                return None
+         except Exception as err:
+             if update_diagnostics_on_error:
+                 self._runtime.update_diagnostics(last_error=str(err))
+@@ -1025,7 +1259,31 @@
+         including handler errors and delegate exceptions. The configured agent may be
+         an LLM and must not be bypassed based on assumptions about local side effects.
+         """
+-        return await self._delegate_text(user_input.text, user_input, primary=False)
++        # Casa patch 2026-09-26: the fallback is Claude (conversation.claude_conversation). No internet / API problem ->
++        # the local brain answers instead (conversation.casa_brain: granite on the voice host), so voice never just fails.
++        try:
++            result = await self._delegate_text(user_input.text, user_input, primary=False)
++        except asyncio.CancelledError:
++            raise
++        except Exception as err:  # noqa: BLE001
++            _LOGGER.warning("Casa: fallback agent failed (%s) - using the local brain", err)
++            result = None
++        if result is not None and not self._result_has_error(result):
++            _CASA_LLM_RESULTS.add(id(user_input))   # the LLM answered: a conversation may go on (_async_process_request)
++            return result
++        if self._fallback_agent_id(HOME_ASSISTANT_AGENT) == _CASA_LOCAL_BRAIN:
++            return result
++        _LOGGER.warning("Casa: fallback agent returned an error - using the local brain")
++        optional_arguments = {
++            argument: getattr(user_input, argument, None)
++            for argument in CONVERSATION_INPUT_OPTIONAL_FIELDS
++            if argument in _ASYNC_CONVERSE_PARAMETERS
++        }
++        return await conversation.async_converse(
++            self.hass, user_input.text, user_input.conversation_id, user_input.context,
++            language=user_input.language, agent_id=_CASA_LOCAL_BRAIN, device_id=user_input.device_id,
++            **optional_arguments,
++        )
+ 
+     async def _async_error_allows_candidate_recovery(
+         self,
+@@ -1281,8 +1539,71 @@
+             return None
+         normalized = getattr(error_code, "value", error_code)
+         return normalized if isinstance(normalized, str) else str(normalized)
++
++    async def _casa_run_cancellable(self, user_input: ConversationInput) -> ConversationResult:
++        """Run the request, but abort it (task cancel -> the LLM HTTP call is dropped too) when the dashboard's X
++        fires `casa_voice_cancel`, or after CASA_TIMEOUT_S."""
++        stop = asyncio.Event()
+ 
++        @callback
++        def _on_cancel(_event) -> None:
++            stop.set()
++
++        unsub = self.hass.bus.async_listen("casa_voice_cancel", _on_cancel)
++        work = asyncio.ensure_future(self._async_process_with_runtime(user_input))
++        waiter = asyncio.ensure_future(stop.wait())
++        try:
++            done, _ = await asyncio.wait({work, waiter}, timeout=CASA_TIMEOUT_S, return_when=asyncio.FIRST_COMPLETED)
++            if work in done:
++                return work.result()
++            work.cancel()
++            with contextlib.suppress(BaseException):
++                await work
++            if waiter in done:
++                raise _CasaCancelled
++            raise asyncio.TimeoutError
++        finally:
++            unsub()
++            waiter.cancel()
++
++    def _casa_bogus_who(self, text: str, result) -> bool:
++        """A 'who is <X>' presence query with no answer where <X> is not one of the house's zones."""
++        m = _re.match(r"^\s*who(?:'s| is| was| are)\s+(?:in |at )?(?:the )?(.+?)[?.!]*\s*$", text or "", _re.I)
++        if not m:
++            return False
++        try:
++            resp = result.response
++            if resp.response_type != intent.IntentResponseType.QUERY_ANSWER:
++                return False
++            if resp.success_results or resp.failed_results:
++                return False
++        except Exception:  # noqa: BLE001
++            return False
++        what = m.group(1).strip().lower()
++        zones = {"home", "away", "not home", "out", "work"}
++        for st in self.hass.states.async_all("zone"):
++            zones.add((st.name or "").lower()); zones.add(st.object_id.replace("_", " ").lower())
++        return what not in zones
++
+     @staticmethod
++    def _spoken_result(user_input: ConversationInput, message: str) -> ConversationResult:
++        """A plain spoken answer (not an error result, so no satellite error tone); never re-listens."""
++        response = intent.IntentResponse(language=user_input.language)
++        response.async_set_speech(message)
++        return ConversationResult(response=response, conversation_id=user_input.conversation_id,
++                                  continue_conversation=False)
++
++    def _casa_report(self, user_input: ConversationInput, detail: str) -> None:
++        """Keep the full error for later: HA log + logbook + a `casa_voice_error` event."""
++        heard = getattr(user_input, "text", "")
++        device = getattr(user_input, "device_id", None)
++        _LOGGER.warning("Casa voice error (spoke a short message instead) heard=%r device=%s detail=%s", heard, device, detail)
++        with contextlib.suppress(Exception):
++            self.hass.bus.async_fire("casa_voice_error", {"heard": heard, "device_id": device, "detail": str(detail)[:2000]})
++            self.hass.async_create_task(self.hass.services.async_call(
++                "logbook", "log", {"name": "Casa voice error", "message": f"heard {heard!r} → {str(detail)[:500]}"}))
++
++    @staticmethod
+     def _error_result(user_input: ConversationInput, message: str) -> ConversationResult:
+         """Build a Home Assistant conversation error result."""
+         response = intent.IntentResponse(language=user_input.language)

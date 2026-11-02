@@ -1,0 +1,5 @@
+debug:
+  fields:
+    tool: { required: false, example: house, selector: { text: {} } }
+    args: { required: false, example: '{"command": "what is the weather tomorrow"}', selector: { object: {} } }
+    device_id: { required: false, selector: { device: {} } }

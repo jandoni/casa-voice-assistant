@@ -1,0 +1,192 @@
+# Weather - answered locally by custom_components/casa_weather from the cached met.no forecast (~1 ms, no LLM).
+# After editing: conversation.reload + assist_canonicalizer.rebuild_index (language en, ?return_response).
+language: "en"
+
+expansion_rules:
+  wx: "(weather|forecast|weather forecast)"
+  whats: "(what's|whats|what is|how's|hows|how is|what will|what'll|how will)"
+  gonna: "(going to|gonna|supposed to)"
+  out: "(outside|out|outdoors|out there)"
+  day: "[for|on|this|for this] {day}"
+  umb: "(an umbrella|my umbrella|the umbrella|a umbrella|umbrella|a raincoat|my raincoat|rain boots)"
+
+intents:
+  HassGetWeather:
+    data:
+      - sentences:
+          - "<whats> the <wx> [like] [today|now|right now|<out>] [please]"
+          - "<whats> it like <out> [today|right now]"
+          - "(tell|give) me the <wx> [please]"
+          - "[the] <wx> [report|update] [please]"
+          - "(current|today's|todays) <wx>"
+          - "what's the <wx> doing"
+          - "how's it looking <out>"
+          - "what('s| is) [the] (weather|temperature) (in|for) (here|my area|the city)"
+
+  CasaWeatherDay:
+    data:
+      - sentences:
+          - "<whats> the <wx> [<gonna> be] [like] <day>"
+          - "<whats> the <wx> (be|be like) <day>"
+          - "<wx> <day>"
+          - "<whats> <day> [look|looking] like"
+          - "what's (the|my) <wx> for {day}"
+          - "what (does|will) <day> look like"
+          - "how('s| is) <day> looking"
+          - "what('s| is) the weather (like|going to be like|gonna be like) {day}"
+
+  CasaWeatherWeek:
+    data:
+      - sentences:
+          - "<whats> the <wx> [<gonna> be] [like] (for|this|for the|for this|over the) {span}"
+          - "<wx> (for|this|for the) {span}"
+          - "(what's|what is) the <wx> (for the|for) (next few days|rest of the week|next days)"
+          - "(what's|what is) the (weekly|week's|weeks) <wx>"
+        slots: {}
+      - sentences:
+          - "(what's|what is) the <wx> (for the|for) (next few days|rest of the week|next days)"
+        slots:
+          span: "week"
+
+  CasaRain:
+    data:
+      - sentences:
+          - "(will|is|does|should) it [<gonna>] rain [<day>]"
+          - "(is it|it's|its) raining [<out>|right now]"
+          - "(is|will) (there|it) [<gonna>] be [any] (rain|showers|a storm|storms|thunderstorms|thunder) [<day>]"
+          - "(any|is there any|chance of|what's the chance of|what are the chances of) (rain|showers|storms) [<day>]"
+          - "will it (storm|pour|shower|drizzle) [<day>]"
+          - "is (rain|a storm) (coming|expected|in the forecast) [<day>]"
+          - "(is it|will it be) (a|going to be a) (rainy|wet|stormy) day [<day>]"
+
+  CasaUmbrella:
+    data:
+      - sentences:
+          - "(do|will|should) (I|we) (need|bring|take|carry) <umb> [<day>]"
+          - "(do|will) (I|we) need an umbrella [<day>]"
+          - "umbrella [<day>]"
+          - "is it umbrella weather [<day>]"
+
+  CasaSnow:
+    data:
+      - sentences:
+          - "(will|is|does) it [<gonna>] snow [<day>]"
+          - "(is it|it's|its) snowing [<out>]"
+          - "(is|will) there [<gonna>] be [any] snow [<day>]"
+          - "(any|chance of) snow [<day>]"
+
+  CasaTempOut:
+    data:
+      - sentences:
+          - "(what's|what is|whats) the temperature <out> [right now|now]"
+          - "(what's|what is|whats) the (outside|outdoor|current outside) temperature"
+          - "how (cold|hot|warm) is it <out> [right now|now|today]"
+          - "how many degrees (is it|<out>) [<out>]"
+          - "what('s| is) the temp <out>"
+          - "temperature <out>"
+
+  CasaFeel:
+    data:
+      - sentences:
+          - "is it {feel} <out> [today|right now|now]"
+          - "is it {feel} today"
+          - "(will|is) it [<gonna>] be {feel} [<out>] [<day>]"
+          - "(do|will|should) (I|we) (need|bring|wear|take) (a|my|the) {garment} [<day>]"
+          - "is it (jacket|coat|sweater) weather [<day>]"
+
+  CasaWind:
+    data:
+      - sentences:
+          - "is it windy [<out>|today|right now]"
+          - "(will|is) it [<gonna>] be windy [<day>]"
+          - "how windy is it [<out>]"
+          - "(what's|what is|how's|how is) the wind [like] [<out>|<day>]"
+          - "how (strong|fast) is the wind"
+
+  CasaHighLow:
+    data:
+      - sentences:
+          - "(what's|what is|whats) the (high|highest temperature|max|maximum) [temperature] [<day>]"
+        slots:
+          which: "high"
+      - sentences:
+          - "(what's|what is|whats) the (low|lowest temperature|min|minimum) [temperature] [<day>]"
+          - "how (cold|low) will it (get|go|be) [<day>]"
+        slots:
+          which: "low"
+      - sentences:
+          - "how (hot|warm|high) will it (get|be) [<day>]"
+        slots:
+          which: "high"
+      - sentences:
+          - "(what's|what is|whats) the temperature [<gonna> be] (for|on) {day}"
+          - "(what's|what is|whats) the temperature [<gonna> be] {day}"
+          - "how (warm|cold|hot) (is it|will it be) {day}"
+        slots:
+          which: "both"
+
+  CasaSun:
+    data:
+      - sentences:
+          - "(when|what time) (is|'s|will be|does) [the] sunset [today|tonight]"
+          - "(when|what time) does the sun (set|go down) [today|tonight]"
+          - "(when|what time) (does it|will it) get dark [today|tonight]"
+          - "how long until (sunset|it gets dark)"
+        slots:
+          event: "sunset"
+      - sentences:
+          - "(when|what time) (is|'s|will be|does) [the] sunrise [tomorrow|today]"
+          - "(when|what time) does the sun (rise|come up) [tomorrow|today]"
+          - "(when|what time) (does it|will it) get light [tomorrow]"
+        slots:
+          event: "sunrise"
+
+  CasaHumidOut:
+    data:
+      - sentences:
+          - "how humid is it <out> [today|right now]"
+          - "(what's|what is|whats) the humidity <out>"
+          - "is it humid <out> [today]"
+
+lists:
+  day:
+    values:
+      - "today"
+      - "tonight"
+      - "tomorrow"
+      - "tomorrow night"
+      - "tomorrow morning"
+      - "this afternoon"
+      - "this evening"
+      - "monday"
+      - "tuesday"
+      - "wednesday"
+      - "thursday"
+      - "friday"
+      - "saturday"
+      - "sunday"
+      - in: "(later|later today|the rest of the day|rest of the day)"
+        out: "today"
+      - in: "(weekend|the weekend|this weekend|over the weekend|saturday and sunday)"
+        out: "weekend"
+  span:
+    values:
+      - in: "(week|this week|the week|next week|coming week|next seven days|7 days|seven days|next 7 days)"
+        out: "week"
+      - in: "(weekend|this weekend|the weekend|coming weekend|saturday and sunday)"
+        out: "weekend"
+  feel:
+    values:
+      - "cold"
+      - "chilly"
+      - "hot"
+      - "warm"
+      - "nice"
+      - in: "(freezing|cool)"
+        out: "cold"
+      - in: "(sunny and warm|nice out|pleasant|nice weather)"
+        out: "nice"
+  garment:
+    values:
+      - in: "(jacket|coat|sweater|hoodie|jumper|layer|scarf|gloves)"
+        out: "jacket"

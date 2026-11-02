@@ -1,0 +1,32 @@
+# Minimal HA package for the pieces in this repo (put it in /config/packages/ and include packages in configuration.yaml).
+# The integrations themselves are enabled with:   casa_endpoint:   casa_live:   casa_weather:   and a casa_brain: block.
+input_boolean:
+  # voice lab test mode: the patched canonicalizer reports what it heard (casa_lab_result) and does nothing
+  casa_voice_lab:
+    name: Voice lab test mode
+    icon: mdi:flask
+
+intent_script:
+  CasaNotUnderstood:
+    description: "casa-stt could not make a command out of what it heard"
+    # ends with "?" -> the patched canonicalizer keeps the satellite listening, no new wake word needed
+    speech:
+      text: "Sorry, I didn't catch that. Could you say it again?"
+  CasaCapture:
+    description: "Wake-word training capture turn: do nothing, say nothing"
+    speech:
+      text: ""
+
+# The Echo's "keep Casa warm" automation that stt/ollama-keepwarm.sh triggers after an Ollama restart: send one text the
+# canonicalizer cannot match, so the Casa LLM prompt is read once and cached (a cold house prompt took ~40 s).
+automation:
+  - id: assist_ai_keep_casa_warm
+    alias: Assist AI keep Casa warm   # -> automation.assist_ai_keep_casa_warm
+    triggers:
+      - trigger: homeassistant
+        event: start
+    actions:
+      - action: conversation.process
+        data:
+          agent_id: conversation.assist_canonicalizer
+          text: ping

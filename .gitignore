@@ -1,0 +1,28 @@
+# secrets and local config: only the *.example files are committed
+config.env
+*.env
+!*.env.example
+secrets/
+
+# generated audio and recordings (never commit recordings from a home)
+ai-eval/stt_clips/
+ai-eval/selftest_clips/
+ai-eval/voice_selftest.log
+voice-lab/results/
+*.wav
+*.mp3
+
+# models and binaries
+*.tflite
+*.onnx
+*.bin
+*.apk
+*.so
+
+# Python / OS / editors
+__pycache__/
+*.py[cod]
+venv/
+.DS_Store
+.idea/
+.vscode/

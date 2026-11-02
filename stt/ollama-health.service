@@ -1,0 +1,7 @@
+[Unit]
+Description=Ollama health check - restart after an iGPU hang leaves it answering empty
+After=ollama.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/casa-stt/ollama-health.sh
